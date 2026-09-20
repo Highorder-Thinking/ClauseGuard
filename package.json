@@ -1,7 +1,8 @@
+
 {
   "name": "clauseguard",
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "AI-powered contract and document risk scanner, built for HackDevengers 2.0."
+  "description": "AI-powered contract and document risk scanner that flags risky clauses and explains them in plain language."
 }
