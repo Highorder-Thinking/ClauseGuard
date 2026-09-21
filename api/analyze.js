@@ -41,7 +41,74 @@ Schema:
   ]
 }`;
 
-const MODEL = "gemini-3.6-flash";
+// Tried in order. If the first is overloaded (503), the next one is used.
+const MODELS = [
+  "gemini-3.6-flash",         // primary
+  "gemini-3.5-flash-lite",    // fallback 1 (lighter, usually less busy)
+  "gemini-flash-lite-latest"  // fallback 2 (always points to the newest flash-lite)
+];
+
+const ATTEMPTS_PER_MODEL = 2;
+const RETRYABLE = new Set([429, 500, 503, 504]);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function callGemini(model, apiKey, text) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+  return fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": apiKey // header instead of ?key= so the key never lands in URLs/logs
+    },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+      contents: [
+        { role: "user", parts: [{ text: `Analyze the following document text for risky clauses:\n\n---\n${text}\n---` }] }
+      ],
+      generationConfig: {
+        temperature: 0.3,
+        maxOutputTokens: 4000,
+        responseMimeType: "application/json"
+      }
+    })
+  });
+}
+
+// Returns a successful Response, or null if every model/attempt failed with a retryable error.
+// Throws-free: non-retryable errors (bad key, bad request) are returned as-is so the caller can report them.
+async function callWithFallback(apiKey, text) {
+  let lastResp = null;
+
+  for (const model of MODELS) {
+    for (let attempt = 1; attempt <= ATTEMPTS_PER_MODEL; attempt++) {
+      let resp;
+      try {
+        resp = await callGemini(model, apiKey, text);
+      } catch (e) {
+        console.error(`Gemini network error (${model}, attempt ${attempt}):`, e);
+        await sleep(1000 * attempt);
+        continue;
+      }
+
+      if (resp.ok) return resp;
+
+      const errText = await resp.clone().text();
+      console.error(`Gemini API error (${model}, attempt ${attempt}):`, resp.status, errText);
+      lastResp = resp;
+
+      // Model name doesn't exist / retired -> skip straight to the next model
+      if (resp.status === 404) break;
+
+      // Not something a retry can fix (bad key, bad request, etc.)
+      if (!RETRYABLE.has(resp.status)) return resp;
+
+      // Overloaded / rate limited: wait a bit, then retry (1s, then move on to next model)
+      if (attempt < ATTEMPTS_PER_MODEL) await sleep(1000 * attempt);
+    }
+  }
+
+  return lastResp; // may be null if every attempt was a network error
+}
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
@@ -58,29 +125,16 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "Not enough document text to analyze." });
   }
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${apiKey}`;
-
   try {
-    const geminiResp = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        contents: [
-          { role: "user", parts: [{ text: `Analyze the following document text for risky clauses:\n\n---\n${text}\n---` }] }
-        ],
-        generationConfig: {
-          temperature: 0.3,
-          maxOutputTokens: 4000,
-          responseMimeType: "application/json"
-        }
-      })
-    });
+    const geminiResp = await callWithFallback(apiKey, text);
 
-    if (!geminiResp.ok) {
-      const errText = await geminiResp.text();
-      console.error("Gemini API error:", geminiResp.status, errText);
-      return res.status(502).json({ error: "The AI service couldn't process this document right now. Try again in a moment." });
+    if (!geminiResp || !geminiResp.ok) {
+      const busy = !geminiResp || RETRYABLE.has(geminiResp.status);
+      return res.status(busy ? 503 : 502).json({
+        error: busy
+          ? "The AI service is very busy right now. Please try again in a minute."
+          : "The AI service couldn't process this document right now. Try again in a moment."
+      });
     }
 
     const data = await geminiResp.json();
